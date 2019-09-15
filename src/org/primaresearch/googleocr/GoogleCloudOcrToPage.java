@@ -15,6 +15,7 @@
  */
 package org.primaresearch.googleocr;
 
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -24,6 +25,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+
+import javax.imageio.ImageIO;
 
 import org.primaresearch.dla.page.Page;
 import org.primaresearch.dla.page.io.xml.PageXmlInputOutput;
@@ -36,6 +39,7 @@ import org.primaresearch.dla.page.layout.physical.text.impl.TextRegion;
 import org.primaresearch.dla.page.layout.physical.text.impl.Word;
 import org.primaresearch.maths.geometry.Polygon;
 import org.primaresearch.maths.geometry.Rect;
+import org.primaresearch.shared.variable.VariableValue;
 
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.auth.oauth2.GoogleCredentials;
@@ -53,6 +57,7 @@ import com.google.cloud.vision.v1.ImageContext;
 import com.google.cloud.vision.v1.Paragraph;
 import com.google.cloud.vision.v1.Symbol;
 import com.google.cloud.vision.v1.TextAnnotation;
+import com.google.cloud.vision.v1.LocalizedObjectAnnotation;
 import com.google.cloud.vision.v1.TextAnnotation.DetectedBreak.BreakType;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
@@ -82,6 +87,7 @@ public class GoogleCloudOcrToPage {
 		String outputXmlFilePath = null;
 		String language = null;
 		String credentialsFilePath = null;
+		String mode = "ocr";
 		for (int i=0; i<args.length; i++) {
 			if ("-img".equals(args[i])) {
 				i++;
@@ -99,6 +105,10 @@ public class GoogleCloudOcrToPage {
 				i++;
 				credentialsFilePath = args[i];
 			}
+			else if ("-mode".equals(args[i])) {
+				i++;
+				mode = args[i];
+			}
 			else if ("-debug".equals(args[i])) {
 				debug = true;
 			}
@@ -109,6 +119,7 @@ public class GoogleCloudOcrToPage {
 			System.out.println("output: "+outputXmlFilePath);
 			System.out.println("lang: "+language);
 			System.out.println("credentials: "+credentialsFilePath);
+			System.out.println("mode: "+mode);
 		}
 		
 		if (imageFilePath == null || outputXmlFilePath == null || credentialsFilePath == null) {
@@ -116,7 +127,7 @@ public class GoogleCloudOcrToPage {
 			System.exit(0);
 		}
 			
-		GoogleCloudOcrToPage tool = new GoogleCloudOcrToPage(imageFilePath, outputXmlFilePath, language, credentialsFilePath);
+		GoogleCloudOcrToPage tool = new GoogleCloudOcrToPage(imageFilePath, outputXmlFilePath, language, credentialsFilePath, mode);
 		tool.run();
 		System.out.println("Exit code: " + tool.getErrorCode());
 		
@@ -141,6 +152,8 @@ public class GoogleCloudOcrToPage {
 		System.out.println("");
 		System.out.println("  -credentials <json file> Google cloud API service key file.");
 		System.out.println("");
+		System.out.println("  -mode <ocr|object>       Recognition mode (optional, default: ocr).");
+		System.out.println("");
 		System.out.println("  -debug                   Enable debug output.");
 	}
 
@@ -150,6 +163,9 @@ public class GoogleCloudOcrToPage {
 	private String outputXmlFilePath = null;
 	private String language = null;
 	private String credentialsFilePath = null;
+	private String mode = null;
+	private int maxX = 100;
+	private int maxY = 100;
 	
 	/** 
 	 * Constructor
@@ -157,14 +173,16 @@ public class GoogleCloudOcrToPage {
 	 * @param outputXmlFilePath Output target
 	 * @param language E.g. 'en'
 	 * @param credentialsFilePath JSON file with Google service key
+	 * @param mode 'ocr' or 'object'
 	 */
 	public GoogleCloudOcrToPage(String imageFilePath, String outputXmlFilePath,
-			String language, String credentialsFilePath) {
+			String language, String credentialsFilePath, String mode) {
 		super();
 		this.imageFilePath = imageFilePath;
 		this.outputXmlFilePath = outputXmlFilePath;
 		this.language = language;	
 		this.credentialsFilePath = credentialsFilePath;		
+		this.mode = mode;
 	}
 	
 	/**
@@ -226,7 +244,11 @@ public class GoogleCloudOcrToPage {
 				
 				Image img = Image.newBuilder().setContent(imgBytes).build();
 				
-				Feature feat = Feature.newBuilder().setType(Type.DOCUMENT_TEXT_DETECTION).build();
+				Feature feat = null;
+				if ("object".equals(mode))
+					feat = Feature.newBuilder().setType(Type.OBJECT_LOCALIZATION).build();
+				else //ocr
+					feat = Feature.newBuilder().setType(Type.DOCUMENT_TEXT_DETECTION).build();
 				
 				ImageContext context = ImageContext.newBuilder().addLanguageHints(language).build();
 				
@@ -247,25 +269,45 @@ public class GoogleCloudOcrToPage {
 						errorCode = 1;
 						return;
 					}
-
-					TextAnnotation textAnno = res.getFullTextAnnotation();
-					if (debug)
-						System.out.println(""+textAnno.getPagesCount()+" Pages");
 					
-					if (textAnno.getPagesCount() > 0) {
-						Page page = handlePage(textAnno.getPages(0));
-						if (page != null) {
-							PageXmlInputOutput.writePage(page, outputXmlFilePath);
+					if ("object".equals(mode)) {
+						try {
+							BufferedImage bimg = ImageIO.read(new File(fileName));
+							maxX = bimg.getWidth();
+							maxY = bimg.getHeight();
+						} catch (Exception exc) {
+							exc.printStackTrace();
 						}
-						else
-							errorCode = 2;
+						
+						List<LocalizedObjectAnnotation> annotations = res.getLocalizedObjectAnnotationsList();
+						if (!annotations.isEmpty()) {
+							Page page = handleObjectAnnotations(annotations);
+							if (page != null) {
+								PageXmlInputOutput.writePage(page, outputXmlFilePath);
+							}
+							else
+								errorCode = 8;
+						}
+						//for (EntityAnnotation annotation : annotations) {
+			          	//	annotation.getAllFields().forEach((k, v) ->
+			            //  System.out.printf("%s : %s\n", k, v.toString()));
+					} //ocr
+					else {
+						TextAnnotation textAnno = res.getFullTextAnnotation();
+						if (debug)
+							System.out.println(""+textAnno.getPagesCount()+" Pages");
+						
+						if (textAnno.getPagesCount() > 0) {
+							Page page = handlePage(textAnno.getPages(0));
+							if (page != null) {
+								PageXmlInputOutput.writePage(page, outputXmlFilePath);
+							}
+							else
+								errorCode = 2;
+						}
 					}
 
 				}
-				/*for (EntityAnnotation annotation : res.getLabelAnnotationsList()) {
-	          		annotation.getAllFields().forEach((k, v) ->
-	              System.out.printf("%s : %s\n", k, v.toString()));
-	        	}*/
 			} catch (IOException e) {
 				e.printStackTrace();
 				errorCode = 3;
@@ -288,6 +330,8 @@ public class GoogleCloudOcrToPage {
 		
 		//Size
 		page.getLayout().setSize(googlePage.getWidth(), googlePage.getHeight());
+		maxX = googlePage.getWidth();
+		maxY = googlePage.getHeight();
 		
 		//Image filename
 		String filename = imageFilePath;
@@ -437,9 +481,17 @@ public class GoogleCloudOcrToPage {
 	private Polygon convertToPolygon(com.google.cloud.vision.v1.BoundingPoly box) {
 		Polygon polygon = new Polygon();
 		
-		for (int i=0; i<box.getVerticesCount(); i++) {
-			polygon.addPoint(	Math.max(0, box.getVertices(i).getX()),
-								Math.max(0, box.getVertices(i).getY()));
+		if (box.getVerticesCount() > 0) {
+			for (int i=0; i<box.getVerticesCount(); i++) {
+				polygon.addPoint(	Math.max(0, box.getVertices(i).getX()),
+									Math.max(0, box.getVertices(i).getY()));
+			}
+		} 
+		else if (box.getNormalizedVerticesCount() > 0) {
+			for (int i=0; i<box.getNormalizedVerticesCount(); i++) {
+				polygon.addPoint(	Math.max(0, (int)(box.getNormalizedVertices(i).getX() * maxX)),
+									Math.max(0, (int)(box.getNormalizedVertices(i).getY() * maxY)));
+			}
 		}
 		
 		return polygon;
@@ -458,6 +510,25 @@ public class GoogleCloudOcrToPage {
 		if (blockType == BlockType.BARCODE)
 			return RegionType.GraphicRegion;
 		return RegionType.UnknownRegion;
+	}
+	
+	private Page handleObjectAnnotations(List<LocalizedObjectAnnotation> annotations) {
+		Page page = new Page();
+		
+		for (LocalizedObjectAnnotation annotation : annotations) {
+			Polygon coords = convertToPolygon(annotation.getBoundingPoly());
+			if (coords.getSize() > 2) {
+				Region region = page.getLayout().createRegion(RegionType.ImageRegion);
+				region.setCoords(coords);
+				try {
+					region.getAttributes().get("custom").setValue(VariableValue.createValueObject(annotation.getName()));
+				} catch (Exception exc) {
+					exc.printStackTrace();
+				}
+			}
+		}
+		
+		return page;
 	}
 
 }
